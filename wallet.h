@@ -48,11 +48,13 @@ protected:
     boost::interprocess::file_lock m_db_lock;
     sqlite3* m_db;
 
+    void UpgradeDatabase();
+
 public:
     Wallet(const boost::filesystem::path& path);
     ~Wallet();
 
-    bool Insert(const SecretWebcash& sk);
+    bool Insert(const SecretWebcash& sk, bool mine);
 };
 
 #endif // WALLET_H

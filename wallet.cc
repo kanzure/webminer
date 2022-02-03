@@ -42,6 +42,92 @@ std::string to_string(const PublicWebcash& epk)
     return webcash_string(epk.amount, "public", epk.pk);
 }
 
+// We group outputs based on their use.  There are currently four categories of
+// webcash recognized by the wallet:
+enum HashType : int {
+    // Pre-generated key that hasn't yet been used for any purpose.  To make
+    // backups possible and to minimize the chance of losing funds if/when
+    // wallet corruption occurs, the wallet maintains a pool of pre-generated
+    // secrets.  These are allocated and used, as needed, in FIFO order.
+    UNUSED = -1,
+
+    // Internal webcash generated either to redeem payments or mined webcash,
+    // change from a payment, or the consolidation of such outputs.  These
+    // outputs count towards the current balance of the wallet, but aren't shown
+    // explicitly.
+    CHANGE = 0,
+
+    // Outputs added via explicit import.  These are shown as visible, discrete
+    // inputs to the wallet.  The wallet always redeems received webcash upon
+    // import under the assumption that the imported secret value is still known
+    // to others or otherwise not secure.
+    RECEIVE = 1,
+
+    // Outputs generated via a mining report.  These are seen as visible inputs
+    // to a wallet, aggregated as "mining income."  The wallet always redeems
+    // mining inputs for change immediately after generation, in case the mining
+    // reports (which contain the secret) are made public.
+    MINING = 2,
+
+    // Outputs generated as payments to others.  These are intended to be
+    // immediately claimed by the other party, but we keep the key in this
+    // wallet in case there are problems completing the transaction.
+    PAYMENT = 3,
+};
+
+struct WalletOutput {
+    int id;
+    uint256 hash;
+    int64_t amount;
+    bool spent;
+};
+
+struct WalletSecret {
+    int id;
+    uint256 secret;
+    std::unique_ptr<int> output_id; // foreign key to WalletOutput
+    bool mine;
+    bool sweep;
+};
+
+void Wallet::UpgradeDatabase()
+{
+    std::array<std::string, 2> tables = {
+        "CREATE TABLE IF NOT EXISTS 'output' ("
+            "'id' INTEGER PRIMARY KEY NOT NULL,"
+            "'hash' BLOB UNIQUE NOT NULL,"
+            "'amount' INTEGER NOT NULL,"
+            "'spent' INTEGER NOT NULL);",
+        "CREATE TABLE IF NOT EXISTS 'secret' ("
+            "'id' INTEGER PRIMARY KEY NOT NULL,"
+            "'secret' BLOB UNIQUE NOT NULL,"
+            "'output_id' INTEGER,"
+            "'mine' INTEGER NOT NULL,"
+            "'sweep' INTEGER NOT NULL,"
+            "FOREIGN KEY('output_id') REFERENCES 'output'('id'));",
+    };
+
+    for (const std::string& stmt : tables) {
+        sqlite3_stmt* create_table;
+        int res = sqlite3_prepare_v2(m_db, stmt.c_str(), stmt.size(), &create_table, nullptr);
+        if (res != SQLITE_OK) {
+            std::string msg(absl::StrCat("Unable to prepare SQL statement [\"", stmt, "\"]: ", sqlite3_errstr(res), " (", std::to_string(res), ")"));
+            std::cerr << msg << std::endl;
+            throw std::runtime_error(msg);
+        }
+        res = sqlite3_step(create_table);
+        if (res != SQLITE_DONE) {
+            std::string msg(absl::StrCat("Running SQL statement [\"", stmt, "\"] returned unexpected status code: ", sqlite3_errstr(res), " (", std::to_string(res), ")"));
+            std::cerr << msg << std::endl;
+            sqlite3_finalize(create_table);
+            throw std::runtime_error(msg);
+        }
+        // Returns the same success/error code as the last invocation, so we can
+        // ignore the return value here.
+        sqlite3_finalize(create_table);
+    }
+}
+
 Wallet::Wallet(const boost::filesystem::path& path)
     : m_logfile(path)
 {
@@ -73,6 +159,7 @@ Wallet::Wallet(const boost::filesystem::path& path)
         std::cerr << msg << std::endl;
         throw std::runtime_error(msg);
     }
+    UpgradeDatabase();
 
     // Touch the wallet file, which will create it if it doesn't already exist.
     // The file locking primitives assume that the file exists, so we need to
@@ -109,10 +196,45 @@ Wallet::~Wallet()
     m_db_lock.unlock();
 }
 
-bool Wallet::Insert(const SecretWebcash& sk)
+bool Wallet::Insert(const SecretWebcash& sk, bool mine)
 {
+    using std::to_string;
     const std::lock_guard<std::mutex> lock(m_mut);
-    return false;
+    bool result = true;
+
+    // First write the key to the wallet recovery file
+    {
+        std::string line = absl::StrCat(mine ? "mining" : "receive", " ", to_string(sk));
+        boost::filesystem::ofstream bak(m_logfile.string(), boost::filesystem::ofstream::app);
+        if (!bak) {
+            std::cerr << "WARNING: Unable to open/create wallet recovery file to save key prior to insertion: \"" << line << "\".  BACKUP THIS KEY NOW TO AVOID DATA LOSS!" << std::endl;
+            // We do not return false here even though there was an error writing to
+            // the recovery log, because we can still attempt to save the key to the
+            // wallet.
+            result = false;
+        } else {
+            bak << line << std::endl;
+            bak.flush();
+        }
+    }
+
+    std::string stmt = absl::StrCat(
+        "INSERT INTO 'secret' ('secret', 'output_id', 'mine', 'sweep')",
+        "VALUES(x'", absl::BytesToHexString(absl::string_view((const char*)sk.sk.begin(), 32)), "', NULL, ", mine ? "TRUE" : "FALSE", ", TRUE);");
+    sqlite3_stmt* insert;
+    int res = sqlite3_prepare_v2(m_db, stmt.c_str(), stmt.size(), &insert, nullptr);
+    if (res != SQLITE_OK) {
+        std::cerr << "Unable to prepare SQL statement [\"" << stmt << "\"]: " << sqlite3_errstr(res) << " (" << std::to_string(res) << ")" << std::endl;
+        return false;
+    }
+    res = sqlite3_step(insert);
+    if (res != SQLITE_DONE) {
+        std::cerr << "Running SQL statement [\"" << stmt << "\"] returned unexpected status code: " << sqlite3_errstr(res) << " (" << std::to_string(res) << ")" << std::endl;
+        result = false;
+    }
+    sqlite3_finalize(insert);
+
+    return result;
 }
 
 // End of File
